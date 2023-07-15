@@ -15,7 +15,7 @@ import torch.cuda
 import transformers
 from torch import nn
 from torch.optim.lr_scheduler import OneCycleLR
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
 from transformers.trainer_pt_utils import get_parameter_names
 
@@ -23,6 +23,7 @@ from axolotl.utils.callbacks import (
     SaveBetterTransformerModelCallback,
     SavePeftModelCallback,
 )
+from axolotl.utils.dataloader import MultipackDistributedDataloader
 from axolotl.utils.sampler import MultipackDistributedBatchSampler
 from axolotl.utils.schedulers import (
     InterpolatingLogScheduler,
@@ -38,6 +39,7 @@ def _find_multiple(val1, val2):
 
 def batch_to_tensor(batch, pad_id=0, dtype=torch.long, loss_dtype=torch.bfloat16):
     # Pad an unused item to reach multiple of 64, for faster GEMM
+    batch["length"] = list(len(sample) for sample in batch["input_ids"])
     pad_cur_len = sum(list(batch["length"]))
     pad_len = _find_multiple(pad_cur_len, 64) - pad_cur_len
 
@@ -77,7 +79,7 @@ def batch_to_tensor(batch, pad_id=0, dtype=torch.long, loss_dtype=torch.bfloat16
 
         # Input IDs & shifted labels
         # shifted_label_ids = torch.where(masks, tokens, IGNORE_LABEL_ID)
-        shifted_label_ids = labels_list
+        shifted_label_ids = torch.tensor(labels_list, dtype=torch.int32, device="cpu")
         shifted_label_ids = torch.nn.functional.pad(
             shifted_label_ids[1:], (0, 1), "constant", IGNORE_LABEL_ID
         )
@@ -171,6 +173,23 @@ class AxolotlTrainer(Trainer):
             seed=self.args.seed,
         )
 
+    def get_train_dataloader(self) -> DataLoader:
+        if self.args.sample_packing:
+            lengths = np.array(
+                [len(sample["input_ids"]) for sample in self.train_dataset]
+            )
+
+            return MultipackDistributedDataloader(
+                dataset=self.train_dataset,
+                lengths=lengths,
+                batch_max_length=self.args.per_device_train_batch_size
+                * self.args.max_seq_length,
+                collate_fn=batch_to_tensor,
+                seed=self.args.seed,
+            )
+        else:
+            return super().get_train_dataloader()
+
     def _get_eval_sampler(
         self, eval_dataset: Dataset
     ) -> Optional[torch.utils.data.Sampler]:
@@ -181,6 +200,21 @@ class AxolotlTrainer(Trainer):
             lengths=lengths,
             seed=self.args.seed,
         )
+
+    def get_eval_dataloader(self, eval_dataset: Optional[Dataset] = None) -> DataLoader:
+        if self.args.sample_packing:
+            lengths = np.array([len(sample["input_ids"]) for sample in eval_dataset])
+
+            return MultipackDistributedDataloader(
+                dataset=eval_dataset,
+                lengths=lengths,
+                batch_max_length=self.args.per_device_eval_batch_size
+                * self.args.max_seq_length,
+                collate_fn=batch_to_tensor,
+                seed=self.args.seed,
+            )
+        else:
+            return super().get_eval_dataloader(eval_dataset=eval_dataset)
 
 
 class OneCycleLRSchedulerTrainer(AxolotlTrainer):

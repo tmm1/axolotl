@@ -1,12 +1,10 @@
 # pylint: skip-file
 
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import numba
 import numpy as np
-import torch
 import torch.distributed as dist
-from torch.utils.data import BatchSampler
 
 
 @numba.njit
@@ -38,8 +36,8 @@ def ffd_with_result(a: np.ndarray, c: int, start_index: int):
     indices = np.argsort(a)[::-1]
     a = a[indices]
 
-    bins: List[int] = []
-    bins_result: List[Any] = []
+    bins = []
+    bins_result = []
     for a_id, size in enumerate(a):
         add_new = True
         for idx in range(len(bins)):
@@ -71,24 +69,24 @@ def allocate(
 
     while True:
         # binary search [l, r)
-        left = 1
-        right = 1 + np.searchsorted(lengths_cumsum[start_index:], s + c * n, "right")
+        l = 1
+        r = 1 + np.searchsorted(lengths_cumsum[start_index:], s + c * n, "right")
 
-        while right - left > 1:
-            m = (left + right) // 2
+        while r - l > 1:
+            m = (l + r) // 2
             if ffd_check(lengths[start_index : start_index + m], c, n):
-                left = m
+                l = m
             else:
-                right = m
+                r = m
 
         # use length l
         batch, tot_seqs = ffd_with_result(
-            lengths[start_index : start_index + left], c, start_index
+            lengths[start_index : start_index + l], c, start_index
         )
         if len(batch) < n:
             break
 
-        start_index += left
+        start_index += l
         s = lengths_cumsum[start_index - 1]
 
         # add local rank
@@ -99,21 +97,29 @@ def allocate(
     return result, result_totseqs, s, len(result) * c * n
 
 
-class MultipackDistributedBatchSampler(BatchSampler):
-    """Unpadded length sampling using Multipack.
+class MultipackDistributedDataloader:
+    """Unpadded data loading using Multipack.
     Approximate (at most ~1.22x) the optimal solution of the identical-machines scheduling problem, which is NP-hard.
     """
 
-    sampler = {"generator": torch.Generator()}
-
     def __init__(
         self,
-        batch_max_length: int,
+        dataset: Any,
         lengths: List[int],
+        batch_max_length: int,
+        collate_fn: Callable,
         num_replicas: Optional[int] = None,
         rank: Optional[int] = None,
         seed: int = 0,
     ):
+        # Dataset
+        self.dataset = dataset
+        self.lengths = lengths
+        assert isinstance(self.lengths, np.ndarray)
+
+        self.batch_max_length = batch_max_length
+        self.collate_fn = collate_fn
+
         # Get rank
         if num_replicas is None:
             if not dist.is_available():
@@ -126,12 +132,11 @@ class MultipackDistributedBatchSampler(BatchSampler):
 
         self.num_replicas = num_replicas
         self.rank = rank
+
+        # Seed
         self.seed = seed
 
-        self.batch_max_length = batch_max_length
-        self.lengths = lengths
-        assert isinstance(self.lengths, np.ndarray)
-
+        # Epoch
         self.epoch = 0
 
         # statistics
@@ -167,8 +172,14 @@ class MultipackDistributedBatchSampler(BatchSampler):
         return batches, totseqs
 
     def __iter__(self):
-        all_batches, _ = self.generate_batches(set_stats=True)
-        return iter(all_batches)
+        all_batches, all_totseqs = self.generate_batches(set_stats=True)
+
+        for batch, totseq in zip(all_batches, all_totseqs):
+            yield self.collate_fn(self.dataset[batch]), totseq
+
+    def __len__(self):
+        batches, _ = self.generate_batches()
+        return len(batches)
 
     def num_batches(self):
         batches, _ = self.generate_batches()
