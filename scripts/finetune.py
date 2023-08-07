@@ -206,6 +206,7 @@ def train(
     setup_wandb_env_vars(cfg)
     if cfg.device == "mps":
         cfg.load_in_8bit = False
+        cfg.load_in_4bit = False
         cfg.tf32 = False
         if cfg.bf16:
             cfg.fp16 = True
