@@ -208,8 +208,7 @@ def train(
         cfg.load_in_8bit = False
         cfg.load_in_4bit = False
         cfg.tf32 = False
-        if cfg.bf16:
-            cfg.fp16 = True
+        cfg.fp16 = False
         cfg.bf16 = False
 
     if cfg.tf32:
