@@ -20,3 +20,4 @@ rouge-score==0.1.2
 scipy
 scikit-learn==1.2.2
 pynvml
+flash-attn==2.0.7
