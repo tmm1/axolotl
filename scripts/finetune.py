@@ -1,5 +1,6 @@
 """Prepare and train a model on a dataset. Can also infer from a model or merge lora"""
 
+import gc
 import importlib
 import logging
 import os
@@ -21,6 +22,7 @@ from optimum.bettertransformer import BetterTransformer
 from transformers import GenerationConfig, TextStreamer
 
 from axolotl.logging_config import configure_logging
+from axolotl.utils.bench import log_gpu_memory_usage
 from axolotl.utils.config import normalize_config, validate_config
 from axolotl.utils.data import prepare_dataset
 from axolotl.utils.dict import DictDefault
@@ -253,6 +255,45 @@ def train(
     )
 
     model.config.use_cache = False
+
+    if cfg.trainer_warmup:
+        LOG.info("Warming up model to preallocate buffers...")
+        model.train()
+        if cfg.gradient_checkpointing:
+            model.gradient_checkpointing_enable()
+        for _ in range(3):
+            inputs = torch.randint(
+                0,
+                len(tokenizer.get_vocab()),
+                (1, cfg.sequence_len * cfg.micro_batch_size),
+                device=model.device,
+                dtype=torch.long,
+            )
+            out = model(
+                input_ids=inputs,
+                labels=inputs,
+                position_ids=torch.randint(
+                    0,
+                    cfg.sequence_len,
+                    (1, cfg.sequence_len * cfg.micro_batch_size),
+                    device=model.device,
+                    dtype=torch.long,
+                ),
+                attention_mask=torch.randint(
+                    0,
+                    1,
+                    (1, cfg.sequence_len * cfg.micro_batch_size),
+                    device=model.device,
+                    dtype=torch.long,
+                ),
+            )
+            out.loss.backward()
+        del out
+        del inputs
+        model.zero_grad()
+    gc.collect()
+    torch.cuda.empty_cache()
+    log_gpu_memory_usage(LOG, "after warmup", model.device)
 
     if torch.__version__ >= "2" and sys.platform != "win32":
         LOG.info("Compiling torch model")
